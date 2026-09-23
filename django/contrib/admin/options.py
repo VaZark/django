@@ -264,6 +264,144 @@ class AdminSitePage:
         }
 
 
+class AdminTemplateView(AdminSitePage):
+    """A model-free counterpart to BaseModelAdmin, registered with an AdminSite."""
+
+    app_label = None
+    title = None
+    path = None
+    url_name = None
+    required_permissions = ()
+    template_name = "admin/page.html"
+
+    def __init__(self, site=None):
+        super().__init__(site)
+        app_config = apps.get_containing_app_config(self.__module__)
+        app_label = self.app_label or (app_config.label if app_config else None)
+        try:
+            apps.get_app_config(app_label)
+        except LookupError as exc:
+            raise ImproperlyConfigured(
+                "AdminView.app_label must identify an installed application."
+            ) from exc
+        if not self.title or not isinstance(self.path, str) or not self.path.strip("/"):
+            raise ImproperlyConfigured(
+                "AdminView requires a title and a nonempty path."
+            )
+        route = self.path.lstrip("/")
+        if any(char in route for char in "<>?#") or any(
+            part in {".", "..", ""} for part in route.rstrip("/").split("/")
+        ):
+            raise ImproperlyConfigured("AdminView.path must be a static URL path.")
+        name = self.url_name or f"{app_label}_{self.__class__.__name__.lower()}"
+        if not isinstance(name, str):
+            raise ImproperlyConfigured("AdminView.url_name must be a string.")
+        name = name.removeprefix("admin:")
+        if not name or ":" in name:
+            raise ImproperlyConfigured(
+                "AdminView.url_name must be an unqualified name."
+            )
+        permissions = self.required_permissions or ()
+        if not isinstance(permissions, (list, tuple)) or any(
+            not isinstance(perm, str) or "." not in perm or not all(perm.split(".", 1))
+            for perm in permissions
+        ):
+            raise ImproperlyConfigured(
+                "AdminView.required_permissions must contain 'app_label.codename' strings."
+            )
+        for perm in permissions:
+            label, codename = perm.split(".", 1)
+            if len(codename) > 100:
+                raise ImproperlyConfigured(
+                    "AdminView permission codenames must be at most 100 characters."
+                )
+            try:
+                apps.get_app_config(label)
+            except LookupError as exc:
+                raise ImproperlyConfigured(
+                    "AdminView permissions must belong to installed applications."
+                ) from exc
+        model_name = self.__class__.__name__.lower()
+        if len(model_name) > 95:
+            raise ImproperlyConfigured(
+                "AdminView class names must be at most 95 characters."
+            )
+        if any(
+            model._meta.model_name == model_name
+            for model in apps.get_app_config(app_label).get_models()
+        ):
+            raise ImproperlyConfigured(
+                "AdminView class names must not conflict with model names."
+            )
+        self._meta = AdminSitePageMeta(app_label, self.title, route, name, model_name)
+
+    def get_admin_page_meta(self):
+        return self._meta
+
+    def has_permission(self, request):
+        opts = self.get_admin_page_meta()
+        codename = get_permission_codename("view", opts)
+        return (
+            self.admin_site.has_permission(request)
+            and request.user.has_perm(f"{opts.app_label}.{codename}")
+            and request.user.has_perms(self.required_permissions or ())
+        )
+
+    def get_urls(self):
+        from django.urls import path
+
+        meta = self.get_admin_page_meta()
+        return [path(meta.path, self._wrap_view(self.view), name=meta.url_name)]
+
+    def check_url_conflicts(self, urlpatterns):
+        from django.urls import URLResolver
+
+        urlpatterns = list(urlpatterns)
+
+        def names(patterns):
+            for pattern in patterns:
+                if isinstance(pattern, URLResolver):
+                    yield from names(pattern.url_patterns)
+                else:
+                    yield pattern.name
+
+        meta = self.get_admin_page_meta()
+        route = f"{meta.app_label}/{meta.path}"
+        conflict = meta.url_name in {*names(urlpatterns), "app_list"}
+        for pattern in urlpatterns:
+            try:
+                if pattern.resolve(route):
+                    conflict = True
+                    break
+            except Resolver404:
+                pass
+        if conflict:
+            raise ImproperlyConfigured(
+                f"Admin page {meta.url_name!r} conflicts with an existing admin URL."
+            )
+
+    def get_navigation_item(self, request):
+        if not self.has_permission(request):
+            return None
+        meta = self.get_admin_page_meta()
+        return {
+            "name": meta.title,
+            "object_name": f"page-{meta.url_name}",
+            "perms": {"view": True},
+            "admin_url": reverse(
+                f"admin:{meta.url_name}", current_app=self.admin_site.name
+            ),
+            "add_url": None,
+            "view_only": True,
+            "page": self,
+        }
+
+    def view(self, request):
+        return TemplateResponse(
+            request, self.template_name, self.get_context_data(request)
+        )
+
+
 class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
     """Functionality common to both ModelAdmin and InlineAdmin."""
 

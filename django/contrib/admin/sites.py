@@ -66,6 +66,7 @@ class AdminSite:
 
     def __init__(self, name="admin"):
         self._registry = {}  # model_class class -> admin_class instance
+        self._page_registry = {} # admin page class -> admin page instance
         self.name = name
         self._actions = {"delete_selected": actions.delete_selected}
         self._global_actions = self._actions.copy()
@@ -147,6 +148,34 @@ class AdminSite:
 
                 # Instantiate the admin class to save in the registry
                 self._registry[model] = admin_class(model, self)
+
+    def register_view(self, page_class):
+        """Register an AdminSitePage subclass without instantiating a model."""
+        if not isinstance(page_class, type) or not issubclass(
+            page_class, AdminSitePage
+        ):
+            raise ValueError("page_class must subclass AdminSitePage.")
+        if page_class in self._page_registry:
+            raise AlreadyRegistered(
+                f"The page {page_class.__name__} is already registered."
+            )
+        page = page_class(self)
+        meta = page.get_admin_page_meta()
+        for registered in self._page_registry.values():
+            other = registered.get_admin_page_meta()
+            if meta.url_name == other.url_name or (
+                meta.app_label == other.app_label and meta.path == other.path
+            ):
+                raise AlreadyRegistered(
+                    "An admin page with this URL is already registered."
+                )
+        self._page_registry[page_class] = page
+
+    def unregister_view(self, page_class):
+        try:
+            del self._page_registry[page_class]
+        except KeyError:
+            raise NotRegistered(f"The page {page_class.__name__} is not registered.")
 
     def unregister(self, model_or_iterable):
         """
@@ -485,7 +514,7 @@ class AdminSite:
 
     def get_registered_pages(self):
         """Return the AdminSitePage instances registered with this site."""
-        return list(chain(self._registry.values()))
+        return list(chain(self._registry.values(), self._page_registry.values()))
 
     def _build_app_dict(self, request, label=None):
         """Group accessible registrations by application."""

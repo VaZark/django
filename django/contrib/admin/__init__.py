@@ -1,4 +1,4 @@
-from django.contrib.admin.decorators import action, display, register
+from django.contrib.admin.decorators import action, display, register, register_view
 from django.contrib.admin.filters import (
     AllValuesFieldListFilter,
     BooleanFieldListFilter,
@@ -16,6 +16,9 @@ from django.contrib.admin.options import (
     VERTICAL,
     Action,
     ActionLocation,
+    AdminSitePageMeta,
+    AdminSitePage,
+    AdminTemplateView,
     ModelAdmin,
     ShowFacets,
     StackedInline,
@@ -30,6 +33,10 @@ __all__ = [
     "ActionLocation",
     "display",
     "register",
+    "register_view",
+    "AdminSitePageMeta",
+    "AdminSitePage",
+    "AdminTemplateView",
     "ModelAdmin",
     "HORIZONTAL",
     "VERTICAL",

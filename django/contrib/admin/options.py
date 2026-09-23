@@ -42,6 +42,7 @@ from django.core.exceptions import (
     BadRequest,
     FieldDoesNotExist,
     FieldError,
+    ImproperlyConfigured,
     PermissionDenied,
     ValidationError,
 )
@@ -61,7 +62,7 @@ from django.forms.widgets import CheckboxSelectMultiple, SelectMultiple
 from django.http import HttpResponseRedirect
 from django.http.response import HttpResponseBase
 from django.template.response import SimpleTemplateResponse, TemplateResponse
-from django.urls import reverse
+from django.urls import NoReverseMatch, Resolver404, reverse, reverse_lazy
 from django.utils.decorators import method_decorator
 from django.utils.deprecation import (
     RemovedInDjango2028Warning,
@@ -175,6 +176,92 @@ FORMFIELD_FOR_DBFIELD_DEFAULTS = {
 }
 
 csrf_protect_m = method_decorator(csrf_protect)
+
+
+@dataclass(frozen=True)
+class AdminSitePageMeta:
+    app_label: str
+    title: str
+    path: str
+    url_name: str
+    model_name: str
+    default_permissions: tuple = ("view",)
+    permissions: tuple = ()
+
+    @property
+    def verbose_name_raw(self):
+        return self.title
+
+
+class AdminSitePage:
+    """Shared interface for independently registered admin pages."""
+
+    def __init__(self, site=None):
+        from django.contrib.admin.sites import AdminSite
+        from django.contrib.admin.sites import site as default_site
+
+        self.admin_site = site or default_site
+        if not isinstance(self.admin_site, AdminSite):
+            raise ValueError("site must subclass AdminSite")
+
+    def get_admin_page_meta(self):
+        raise NotImplementedError
+
+    def get_urls(self):
+        raise NotImplementedError
+
+    def get_navigation_item(self, request):
+        """Return a navigation item, or None when the user cannot access it."""
+        raise NotImplementedError
+
+    def get_url_prefix(self):
+        return f"{self.get_admin_page_meta().app_label}/"
+
+    @property
+    def urls(self):
+        return self.get_urls()
+
+    def has_permission(self, request):
+        return self.admin_site.has_permission(request)
+
+    def _wrap_view(self, view, cacheable=False):
+        def inner(request, *args, **kwargs):
+            if not self.has_permission(request):
+                raise PermissionDenied
+            request.current_app = self.admin_site.name
+            return view(request, *args, **kwargs)
+
+        update_wrapper(inner, view)
+
+        def wrapper(*args, **kwargs):
+            return self.admin_site.admin_view(inner, cacheable)(*args, **kwargs)
+
+        wrapper.admin_site = self.admin_site
+        wrapper.admin_site_page = self
+        wrapper.login_url = reverse_lazy(
+            "admin:login", current_app=self.admin_site.name
+        )
+        return update_wrapper(wrapper, view)
+
+    def check_url_conflicts(self, urlpatterns):
+        """Validate this registration against other mounted admin URLs."""
+
+    def get_context_data(self, request, **kwargs):
+        meta = self.get_admin_page_meta()
+        return {
+            **self.admin_site.each_context(request),
+            "title": meta.title,
+            "subtitle": None,
+            "page": self,
+            "app_label": meta.app_label,
+            "app_name": apps.get_app_config(meta.app_label).verbose_name,
+            "app_url": reverse(
+                "admin:app_list",
+                kwargs={"app_label": meta.app_label},
+                current_app=self.admin_site.name,
+            ),
+            **kwargs,
+        }
 
 
 class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
@@ -686,7 +773,7 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         return request.user.has_module_perms(self.opts.app_label)
 
 
-class ModelAdmin(BaseModelAdmin):
+class ModelAdmin(BaseModelAdmin, AdminSitePage):
     """Encapsulate all admin options and functionality for a given model."""
 
     list_display = ("__str__",)
@@ -739,8 +826,19 @@ class ModelAdmin(BaseModelAdmin):
     def __init__(self, model, admin_site):
         self.model = model
         self.opts = model._meta
-        self.admin_site = admin_site
+        AdminSitePage.__init__(self, admin_site)
         super().__init__()
+
+    def get_admin_page_meta(self):
+        return AdminSitePageMeta(
+            app_label=self.opts.app_label,
+            title=capfirst(self.opts.verbose_name_plural),
+            path=f"{self.opts.model_name}/",
+            url_name=f"{self.opts.app_label}_{self.opts.model_name}_changelist",
+            model_name=self.opts.model_name,
+            default_permissions=self.opts.default_permissions,
+            permissions=self.opts.permissions,
+        )
 
     def __str__(self):
         return "%s.%s" % (self.opts.app_label, self.__class__.__name__)
@@ -768,15 +866,18 @@ class ModelAdmin(BaseModelAdmin):
 
         return inline_instances
 
+    def get_url_prefix(self):
+        return f"{super().get_url_prefix()}{self.opts.model_name}/"
+
+    def _wrap_view(self, view, cacheable=False):
+        wrapper = super()._wrap_view(view, cacheable)
+        wrapper.model_admin = self
+        return wrapper
+
     def get_urls(self):
         from django.urls import path
 
-        def wrap(view):
-            def wrapper(*args, **kwargs):
-                return self.admin_site.admin_view(view)(*args, **kwargs)
-
-            wrapper.model_admin = self
-            return update_wrapper(wrapper, view)
+        wrap = self._wrap_view
 
         info = self.opts.app_label, self.opts.model_name
 
@@ -810,10 +911,6 @@ class ModelAdmin(BaseModelAdmin):
         ]
 
     @property
-    def urls(self):
-        return self.get_urls()
-
-    @property
     def media(self):
         extra = "" if settings.DEBUG else ".min"
         js = [
@@ -827,6 +924,39 @@ class ModelAdmin(BaseModelAdmin):
             "vendor/xregexp/xregexp%s.js" % extra,
         ]
         return forms.Media(js=["admin/js/%s" % url for url in js])
+
+    def get_navigation_item(self, request):
+        if not self.has_module_permission(request):
+            return None
+        perms = self.get_model_perms(request)
+        if True not in perms.values():
+            return None
+        meta = self.get_admin_page_meta()
+        item = {
+            "model": self.model,
+            "name": meta.title,
+            "object_name": self.opts.object_name,
+            "perms": perms,
+            "admin_url": None,
+            "add_url": None,
+        }
+        if perms.get("change") or perms.get("view"):
+            item["view_only"] = not perms.get("change")
+            try:
+                item["admin_url"] = reverse(
+                    f"admin:{meta.url_name}", current_app=self.admin_site.name
+                )
+            except NoReverseMatch:
+                pass
+        if perms.get("add"):
+            try:
+                item["add_url"] = reverse(
+                    f"admin:{self.opts.app_label}_{self.opts.model_name}_add",
+                    current_app=self.admin_site.name,
+                )
+            except NoReverseMatch:
+                pass
+        return item
 
     def get_model_perms(self, request):
         """
@@ -2208,7 +2338,7 @@ class ModelAdmin(BaseModelAdmin):
         else:
             title = _("View %s")
         context = {
-            **self.admin_site.each_context(request),
+            **self.get_context_data(request),
             "title": title % self.opts.verbose_name,
             "subtitle": (
                 display_for_value(str(obj), EMPTY_VALUE_STRING) if obj else None
@@ -2460,7 +2590,7 @@ class ModelAdmin(BaseModelAdmin):
         )
 
         context = {
-            **self.admin_site.each_context(request),
+            **self.get_context_data(request),
             "module_name": str(self.opts.verbose_name_plural),
             "selection_note": _("0 of %(cnt)s selected") % {"cnt": len(cl.result_list)},
             "selection_note_all": selection_note_all % {"total_count": cl.result_count},
@@ -2554,7 +2684,7 @@ class ModelAdmin(BaseModelAdmin):
             title = _("Delete")
 
         context = {
-            **self.admin_site.each_context(request),
+            **self.get_context_data(request),
             "title": title,
             "subtitle": None,
             "object_name": object_name,
@@ -2608,7 +2738,7 @@ class ModelAdmin(BaseModelAdmin):
         page_range = paginator.get_elided_page_range(page_obj.number)
 
         context = {
-            **self.admin_site.each_context(request),
+            **self.get_context_data(request),
             "title": _("Change history: %s")
             % display_for_value(str(obj), EMPTY_VALUE_STRING),
             "subtitle": None,

@@ -1,11 +1,12 @@
 from functools import update_wrapper
+from itertools import chain
 from weakref import WeakSet
 
 from django.apps import apps
 from django.conf import settings
 from django.contrib.admin import ModelAdmin, actions
 from django.contrib.admin.exceptions import AlreadyRegistered, NotRegistered
-from django.contrib.admin.options import EMPTY_VALUE_STRING
+from django.contrib.admin.options import EMPTY_VALUE_STRING, AdminSitePage
 from django.contrib.admin.views.autocomplete import AutocompleteJsonView
 from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.contrib.auth.decorators import login_not_required
@@ -13,11 +14,10 @@ from django.core.exceptions import ImproperlyConfigured, PermissionDenied
 from django.db.models.base import ModelBase
 from django.http import Http404, HttpResponsePermanentRedirect, HttpResponseRedirect
 from django.template.response import TemplateResponse
-from django.urls import NoReverseMatch, Resolver404, resolve, reverse, reverse_lazy
+from django.urls import Resolver404, resolve, reverse, reverse_lazy
 from django.utils.decorators import method_decorator
 from django.utils.functional import LazyObject
 from django.utils.module_loading import import_string
-from django.utils.text import capfirst
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy
 from django.views.decorators.cache import never_cache
@@ -291,21 +291,24 @@ class AdminSite:
             ),
         ]
 
-        # Add in each model's views, and create a list of valid URLS for the
-        # app_index
+        # Models and model-free pages expose the same routing interface.
+        registrations = [
+            (page, path(page.get_url_prefix(), include(page.urls)))
+            for page in self.get_registered_pages()
+        ]
         valid_app_labels = []
-        for model, model_admin in self._registry.items():
-            urlpatterns += [
-                path(
-                    "%s/%s/" % (model._meta.app_label, model._meta.model_name),
-                    include(model_admin.urls),
-                ),
-            ]
-            if model._meta.app_label not in valid_app_labels:
-                valid_app_labels.append(model._meta.app_label)
+        for page, pattern in registrations:
+            page.check_url_conflicts(
+                chain(
+                    urlpatterns,
+                    (other for _, other in registrations if other is not pattern),
+                )
+            )
+            app_label = page.get_admin_page_meta().app_label
+            if app_label not in valid_app_labels:
+                valid_app_labels.append(app_label)
+        urlpatterns.extend(pattern for _, pattern in registrations)
 
-        # If there were ModelAdmins registered, we should have a list of app
-        # labels for which we need to allow access to the app_index view,
         if valid_app_labels:
             regex = r"^(?P<app_label>" + "|".join(valid_app_labels) + ")/$"
             urlpatterns += [
@@ -480,64 +483,21 @@ class AdminSite:
                     )
         raise Http404
 
+    def get_registered_pages(self):
+        """Return the AdminSitePage instances registered with this site."""
+        return list(chain(self._registry.values()))
+
     def _build_app_dict(self, request, label=None):
-        """
-        Build the app dictionary. The optional `label` parameter filters models
-        of a specific app.
-        """
+        """Group accessible registrations by application."""
         app_dict = {}
-
-        if label:
-            models = {
-                m: m_a
-                for m, m_a in self._registry.items()
-                if m._meta.app_label == label
-            }
-        else:
-            models = self._registry
-
-        for model, model_admin in models.items():
-            app_label = model._meta.app_label
-
-            has_module_perms = model_admin.has_module_permission(request)
-            if not has_module_perms:
+        for page in self.get_registered_pages():
+            app_label = page.get_admin_page_meta().app_label
+            if label and app_label != label:
                 continue
-
-            perms = model_admin.get_model_perms(request)
-
-            # Check whether user has any perm for this module.
-            # If so, add the module to the model_list.
-            if True not in perms.values():
+            item = page.get_navigation_item(request)
+            if item is None:
                 continue
-
-            info = (app_label, model._meta.model_name)
-            model_dict = {
-                "model": model,
-                "name": capfirst(model._meta.verbose_name_plural),
-                "object_name": model._meta.object_name,
-                "perms": perms,
-                "admin_url": None,
-                "add_url": None,
-            }
-            if perms.get("change") or perms.get("view"):
-                model_dict["view_only"] = not perms.get("change")
-                try:
-                    model_dict["admin_url"] = reverse(
-                        "admin:%s_%s_changelist" % info, current_app=self.name
-                    )
-                except NoReverseMatch:
-                    pass
-            if perms.get("add"):
-                try:
-                    model_dict["add_url"] = reverse(
-                        "admin:%s_%s_add" % info, current_app=self.name
-                    )
-                except NoReverseMatch:
-                    pass
-
-            if app_label in app_dict:
-                app_dict[app_label]["models"].append(model_dict)
-            else:
+            if app_label not in app_dict:
                 app_dict[app_label] = {
                     "name": apps.get_app_config(app_label).verbose_name,
                     "app_label": app_label,
@@ -546,10 +506,10 @@ class AdminSite:
                         kwargs={"app_label": app_label},
                         current_app=self.name,
                     ),
-                    "has_module_perms": has_module_perms,
-                    "models": [model_dict],
+                    "has_module_perms": True,
+                    "models": [],
                 }
-
+            app_dict[app_label]["models"].append(item)
         return app_dict
 
     def get_app_list(self, request, app_label=None):
